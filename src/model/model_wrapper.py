@@ -243,12 +243,50 @@ class ModelWrapper(LightningModule):
             batch["context"]["extrinsics"] = noisy_context_views[:, :n_context_views]
             # batch["target"]["extrinsics"] = all_noisy_poses[:, n_context_views:]
             
-            return 
-        
-
+        #! previous dataloader version (only ours) 
         if self.pred_poses is not None:
             scene = batch["scene"][0]
+            if batch['context']['R'] is not None:
+                R_gt = rearrange(batch['context']['R'], 'b v x y -> (b v) x y')
+                T_gt = rearrange(batch['context']['T'], 'b v x -> (b v) x')
+            else:
+                R_gt = rearrange(batch['context']['extrinsics'], 'b v x y -> (b v) x y')[:,:3,:3]
+                T_gt = rearrange(batch['context']['extrinsics'], 'b v x y -> (b v) x y')[:,:3,3]
             batch['context']['extrinsics'] = self.pred_poses[scene].unsqueeze(0).cuda().float()
+            
+        
+        #! changed dataloader version (only ours) 
+        # if self.pred_poses is not None:
+        #     scene = batch["scene"][0]
+        #     c2ws = rearrange(self.pred_poses[scene].unsqueeze(0).cuda().float(), 'b v x y -> (b v) x y')
+            
+        #     context_indices = rearrange(batch['context']['index'], 'b v -> (b v)')
+        #     # Resize the world to make the baseline 1.
+        #     context_extrinsics = c2ws[context_indices]
+        #     num_views = context_extrinsics.shape[0]
+
+        #     if num_views > 1:
+        #         # Extract the positions of all views
+        #         positions = context_extrinsics[:, :3, 3]
+        #         # Compute pairwise distances
+        #         pairwise_distances = [
+        #             (positions[i] - positions[j]).norm()
+        #             for i in range(num_views) for j in range(i + 1, num_views)
+        #         ]
+        #         # Compute the average pairwise distance as the baseline
+        #         scale = sum(pairwise_distances) / len(pairwise_distances)
+        #         if scale < 1e-3:
+        #             print(
+        #                 f"Skipped because of insufficient baseline "
+        #                 f"{scale:.6f}"
+        #             )
+        #             raise ValueError("Skipped because of insufficient baseline")
+        #         # Normalize all translations
+        #         c2ws[:, :3, 3] /= scale
+        #     else:
+        #         scale = 1
+                
+        #     batch['context']['extrinsics'] = rearrange(c2ws, '(b v) x y -> b v x y', b=1)
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -319,39 +357,36 @@ class ModelWrapper(LightningModule):
                 compute_lpips(rgb_gt, rgb).mean().item()
             )
 
+            if self.pred_poses is not None:
+                if f"rotation_angle" not in self.test_step_outputs:
+                    self.test_step_outputs[f"rotation_angle"] = []
+                if f"translation_angle" not in self.test_step_outputs:
+                    self.test_step_outputs[f"translation_angle"] = []
+                pred_mats = rearrange(batch['context']['extrinsics'], 'b v x y -> (b v) x y')
+                
+                #! CoPoNeRF Style evaluation
+                norm_pred = pred_mats[:,:3,3][1:] / torch.linalg.norm(pred_mats[:,:3,3][1:], dim = -1).unsqueeze(-1) + 1e-6
+                norm_gt =  T_gt[1:] / torch.linalg.norm(T_gt[1:], dim =-1).unsqueeze(-1)
+                cosine_similarity_0 = torch.dot(norm_pred[0], norm_gt[0])
+                cosine_similarity_1 = torch.dot(norm_pred[1], norm_gt[1])
+                angle_degree_1 = torch.arccos(torch.clip(cosine_similarity_0, -1.0,1.0)) * 180 / np.pi
+                angle_degree_2 = torch.arccos(torch.clip(cosine_similarity_1, -1.0,1.0)) * 180 / np.pi
+                avg_angle_degree = (angle_degree_1 + angle_degree_2) / 2
+                
+                geodesic = compute_geodesic_distance_from_two_matrices(pred_mats[..., :3, :3][1:], R_gt[..., :3, :3][1:]) * 180 / np.pi
+                self.test_step_outputs[f"rotation_angle"].append(geodesic.mean().item())
+                self.test_step_outputs[f"translation_angle"].append(avg_angle_degree.item())
 
-            if f"rotation_angle" not in self.test_step_outputs:
-                self.test_step_outputs[f"rotation_angle"] = []
-            if f"translation_angle" not in self.test_step_outputs:
-                self.test_step_outputs[f"translation_angle"] = []
-
-            pred_mats = rearrange(batch['context']['extrinsics'], 'b v x y -> (b v) x y')
-            R_gt = rearrange(batch['context']['R'], 'b v x y -> (b v) x y')
-            T_gt = rearrange(batch['context']['T'], 'b v x -> (b v) x')
+                #! Inference time and GPU memory calculation
+                if f"inference_time" not in self.test_step_outputs:
+                    self.test_step_outputs[f"inference_time"] = []
+                if f"gpu_memory" not in self.test_step_outputs:
+                    self.test_step_outputs[f"gpu_memory"] = []
+                self.test_step_outputs[f"inference_time"].append(elapsed_time)
+                self.test_step_outputs[f"gpu_memory"].append(memory_used / 1024**2)
             
-            #! CoPoNeRF Style evaluation
-            norm_pred = pred_mats[:,:3,3][1:] / torch.linalg.norm(pred_mats[:,:3,3][1:], dim = -1).unsqueeze(-1) + 1e-6
-            norm_gt =  T_gt[1:] / torch.linalg.norm(T_gt[1:], dim =-1).unsqueeze(-1)
-            cosine_similarity_0 = torch.dot(norm_pred[0], norm_gt[0])
-            cosine_similarity_1 = torch.dot(norm_pred[1], norm_gt[1])
-            angle_degree_1 = torch.arccos(torch.clip(cosine_similarity_0, -1.0,1.0)) * 180 / np.pi
-            angle_degree_2 = torch.arccos(torch.clip(cosine_similarity_1, -1.0,1.0)) * 180 / np.pi
-            avg_angle_degree = (angle_degree_1 + angle_degree_2) / 2
-            
-            geodesic = compute_geodesic_distance_from_two_matrices(pred_mats[..., :3, :3][1:], R_gt[..., :3, :3][1:]) * 180 / np.pi
-            self.test_step_outputs[f"rotation_angle"].append(geodesic.mean().item())
-            self.test_step_outputs[f"translation_angle"].append(avg_angle_degree.item())
-
-            #! Inference time and GPU memory calculation
-            if f"inference_time" not in self.test_step_outputs:
-                self.test_step_outputs[f"inference_time"] = []
-            if f"gpu_memory" not in self.test_step_outputs:
-                self.test_step_outputs[f"gpu_memory"] = []
-            self.test_step_outputs[f"inference_time"].append(elapsed_time)
-            self.test_step_outputs[f"gpu_memory"].append(memory_used / 1024**2)
-        
-            print("Rotation:", geodesic, "translation_angle:", avg_angle_degree)
-            print("Rotation error so far:", np.mean(self.test_step_outputs[f"rotation_angle"]), 'Translation_angle so far:', np.mean(self.test_step_outputs[f"translation_angle"]))
+                print("Rotation:", geodesic, "translation_angle:", avg_angle_degree)
+                print("Rotation error so far:", np.mean(self.test_step_outputs[f"rotation_angle"]), 'Translation_angle so far:', np.mean(self.test_step_outputs[f"translation_angle"]))
             
             # print psnr
             print("scene: ", scene, end=' ')

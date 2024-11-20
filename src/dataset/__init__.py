@@ -12,8 +12,8 @@ DATASETS: dict[str, Dataset] = {
 }
 
 
-# DatasetCfg = DatasetRE10kCfg
-DatasetCfg = DatasetDTUCfg
+DatasetCfg = DatasetRE10kCfg
+# DatasetCfg = DatasetDTUCfg
 
 
 def get_dataset(

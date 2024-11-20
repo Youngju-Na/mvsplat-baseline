@@ -102,3 +102,20 @@ def compute_camera_center_error(R_pred, T_pred, R_gt, T_gt, gt_scene_scale):
 
     norms = np.ndarray.tolist(norm.detach().cpu().numpy())
     return norms, A_hat
+
+
+def compute_geodesic_distance_from_two_matrices(m1, m2):
+    batch=m1.shape[0]
+    m = torch.bmm(m1, m2.transpose(1,2)) #batch*3*3
+    
+    cos = (  m[:,0,0] + m[:,1,1] + m[:,2,2] - 1 )/2
+    cos = torch.min(cos, torch.autograd.Variable(torch.ones(batch).to(m1.device)) )
+    cos = torch.max(cos, torch.autograd.Variable(torch.ones(batch).to(m1.device))*-1 )
+    
+    
+    theta = torch.acos(cos)
+    
+    #theta = torch.min(theta, 2*np.pi - theta)
+   
+    
+    return theta

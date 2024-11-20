@@ -15,6 +15,11 @@ from ..visualization.vis_depth import viz_depth_tensor
 import os
 from PIL import Image
 
+import numpy as np
+from src.model.cameras.noisy_pose_generator import initialize_noisy_poses
+from src.model.ray_diffusion.eval.utils import full_scene_scale
+
+
 # Configure beartype and jaxtyping.
 with install_import_hook(
     ("src",),
@@ -88,30 +93,31 @@ with open("assets/evaluation_index_re10k.json") as f:
 # supple scenes
 SCENES = (
     # scene, context 1, context 2, far plane
-    ("scan24", 23, 24, 33, 3.0, [100], 1.0, 19),
-    ("scan37", 23, 24, 33, 3.0, [100], 1.0, 19),
-    ("scan40", 23, 24, 33, 3.0, [100], 1.0, 19),
-    ("scan55", 23, 24, 33, 3.0, [100], 1.0, 19),
-    ("scan63", 23, 24, 33, 3.0, [100], 1.0, 19),
-    ("scan65", 23, 24, 33, 3.0, [100], 1.0, 19),
-    ("scan69", 23, 24, 33, 3.0, [100], 1.0, 19),
-    ("scan83", 23, 24, 33, 3.0, [100], 1.0, 19),
-    ("scan97", 23, 24, 33, 3.0, [100], 1.0, 19),
-    ("scan105", 23, 24, 33, 3.0, [100],1.0, 19),
-    ("scan106", 23, 24, 33, 3.0, [100],1.0, 19),
-    ("scan110", 23, 24, 33, 3.0, [100],1.0, 19),
-    ("scan114", 23, 24, 33, 3.0, [100],1.0, 19),
-    ("scan118", 23, 24, 33, 3.0, [100],1.0, 19),
-    ("scan122", 23, 24, 33, 3.0, [100],1.0, 19),
+    # ("fc60dbb610046c56", 28, 115, 10.0, [60,70, 80, 90, 100, 110], 1.5, 15),
+    # ("1eca36ec55b88fe4", 0, 120, 6.0, [60,70, 80, 90, 100, 110], 1.5, 15), # teaser fig.
+    # ("2c52d9d606a3ece2", 87, 112, 6.0, [60,70, 80, 90, 100, 110], 1.5, 15),
+    # ("71a1121f817eb913", 139, 164, 10.0, [60,70, 80, 90, 100, 110], 1.5, 15),
+    # ("d70fc3bef87bffc1", 67, 92, 10.0, [60,70, 80, 90, 100, 110], 1.5, 15),
+    # ("f0feab036acd7195", 44, 69, 5.0, [60,70, 80, 90, 100, 110], 1.5, 15),
+    # ("a93d9d0fd69071aa", 57, 82, 5.0, [60,70, 80, 90, 100, 110], 1.5, 15),
+    # ("fc6f664a700121e9", 72, 164, 6.0, [60,70, 80, 90, 100, 110], 1.4, 19),
+    # ("b1df812f9a41f543", 191, 249, 6.0, [60,70, 80, 90, 100, 110], 1.4, 19),
+    ("464e3851f923f8d0", 0, 65, 5.5, [60,70, 80, 90, 100, 110], 4.5, 12),
+    # ("4cfefe4588b687a9", 35, 82, 6.0, [60,70, 80, 90, 100, 110], 1.4, 19),
+    # ("2fdfa70413053b84", 18, 106, 6.0, [60,70, 80, 90, 100, 110], 1.4, 19),
+    # ("5ca0d8f0b24ae0aa", 7, 113, 6.0, [60,70, 80, 90, 100, 110], 1.4, 19),
 )
 
-
+NUM_SRC_VIEWS = 2
+NUM_TGT_VIEWS = 2
 FIGURE_WIDTH = 500
 MARGIN = 4
 GAUSSIAN_TRIM = 8
-LINE_WIDTH = 1.8
-LINE_COLOR = [255, 0, 0]
+LINE_WIDTH = 10 
+LINE_COLOR_PRED = [255/255., 92/255., 0/255.] # orange #b38000 # BGR? 255,92,0
+LINE_COLOR_GT = [242/255.,15/255.,215/255.] # 99,107,47
 POINT_DENSITY = 0.5
+
 
 
 @hydra.main(
@@ -152,11 +158,12 @@ def generate_point_cloud_figure(cfg_dict):
         # Create a dataset that always returns the desired scene.
         view_sampler_cfg = ViewSamplerArbitraryCfg(
             "arbitrary",
-            num_views,
-            num_views,
+            2,
+            3,
             context_views=list(context_indices),
-            target_views=[0, 0],  # use [40, 80] for teaser
+            target_views=[0, 25, 65],  # use [40, 80] for teaser
         )
+        
         cfg.dataset.view_sampler = view_sampler_cfg
         cfg.dataset.overfit_to_scene = scene
 
@@ -165,6 +172,21 @@ def generate_point_cloud_figure(cfg_dict):
         example = default_collate([next(iter(dataset))])
         example = apply_to_collection(example, Tensor, lambda x: x.to(device))
 
+        if cfg.test.noisy_pose:
+            n_context_views = example["context"]["extrinsics"].shape[1]
+            n_target_views = example["target"]["extrinsics"].shape[1]
+            
+            gt_scene_scale = full_scene_scale(example['context'])
+            
+            gt_context_views = example["context"]["extrinsics"][..., :3, :4]
+            noisy_context_views, error_R, error_T = initialize_noisy_poses(gt_context_views, noise_level=cfg.test.noisy_level, gt_scene_scale=gt_scene_scale)
+            
+            print("mean Rotation error angle:", np.mean(error_R))
+            print("mean Translation error:", np.mean(error_T))
+        
+            #UPDATE poses to noisy poses
+            example["context"]["extrinsics"] = noisy_context_views[:, :n_context_views]
+            
         # Generate the Gaussians.
         visualization_dump = {}
         gaussians = encoder.forward(
@@ -220,9 +242,9 @@ def generate_point_cloud_figure(cfg_dict):
             ones = torch.ones((1,), dtype=torch.float32, device=device)
             render_args = {
                 "extrinsics": example["context"]["extrinsics"][0, :1] @ pose,
-                "width": ones * far * 1,
-                "height": ones * far * 1,
-                "near": ones * 0,
+                "width": ones * far * 1.5, #! change to 2 for re10k, 1 for dtu
+                "height": ones * far * 1.5, #! change to 2 for re10k, 1 forF dtu
+                "near": ones * 0, #! 0 for re10k, -1.0 for dtu
                 "far": ones * far,
                 "image_shape": (1024, 1024),
                 "background_color": torch.zeros(
@@ -232,7 +254,6 @@ def generate_point_cloud_figure(cfg_dict):
                 "gaussian_covariances": trim(gaussians.covariances),
                 "gaussian_sh_coefficients": trim(gaussians.harmonics),
                 "gaussian_opacities": trim(gaussians.opacities),
-                # "fov_degrees": 1.5,
             }
 
             # Render alpha (opacity).
@@ -275,39 +296,20 @@ def generate_point_cloud_figure(cfg_dict):
 
             # Compute frustum corners for the context views.
             frustum_corners = unproject_frustum_corners(
-                example["context"]["extrinsics"][0],
-                example["context"]["intrinsics"][0],
-                torch.ones((3,), dtype=torch.float32, device=device) * far / cam_div,
+                torch.cat([example["context"]["extrinsics_gt"][0], example['context']['extrinsics'][0]], dim=0),
+                repeat(example["context"]["intrinsics"][0][0:1], "c i j -> (c v) i j", v=example["context"]["extrinsics"].shape[1]*2),
+                torch.ones((example["context"]["extrinsics_gt"].shape[1]*2,), dtype=torch.float32, device=device) * far / cam_div, #! view 개수
             )
-            camera_origins = example["context"]["extrinsics"][0, :, :3, 3]
-            # stack the rendered pose for debugging
-            
-            # frustum_corners = unproject_frustum_corners(
-            #     torch.cat(
-            #         (
-            #             example["context"]["extrinsics"][0],
-            #             example["context"]["extrinsics"][0, :1] @ pose,
-            #         ),
-            #         dim=0,
-            #     ),
-            #     torch.cat(
-            #         (
-            #             example["context"]["intrinsics"][0],
-            #             example["context"]["intrinsics"][0, :1],
-            #         ),
-            #         dim=0,
-            #     ),
-            #     torch.ones((2 + 1,), dtype=torch.float32, device=device) * far / 16,
-            # )
-            # camera_origins = torch.cat(
-            #     (
-            #         example["context"]["extrinsics"][0, :, :3, 3],
-            #         (example["context"]["extrinsics"][0, :1] @ pose)[:, :3, 3],
-            #     ),
-            #     dim=0,
-            # )
+            camera_origins = torch.cat([example["context"]["extrinsics_gt"][0, :, :3, 3], example['context']['extrinsics'][0, :, :3, 3]], dim=0)
 
             # Generate the 3D lines that have to be computed.
+            lc_gt = torch.tensor(LINE_COLOR_GT, dtype=torch.float32, device=device)
+            lc_gt = repeat(lc_gt, "c -> l c", l=NUM_SRC_VIEWS)
+            lc_pred = torch.tensor(LINE_COLOR_PRED, dtype=torch.float32, device=device)
+            lc_pred = repeat(lc_pred, "c -> l c", l=NUM_SRC_VIEWS)
+            
+            line_colors = torch.cat([lc_gt, lc_pred], dim=0)
+            
             lines = []
             for corners, origin in zip(frustum_corners, camera_origins):
                 for i in range(4):
@@ -344,7 +346,7 @@ def generate_point_cloud_figure(cfg_dict):
 
                 # Create the color.
                 lc = torch.tensor(
-                    LINE_COLOR,
+                    line_colors[line_idx // 8],
                     dtype=torch.float32,
                     device=device,
                 )
@@ -400,15 +402,16 @@ def generate_point_cloud_figure(cfg_dict):
 
             # Render depth.
             *_, h, w = example["context"]["image"].shape
-            # rendered = decoder.forward(
-            #     gaussians,
-            #     example["context"]["extrinsics"],
-            #     example["context"]["intrinsics"],
-            #     example["context"]["near"],
-            #     example["context"]["far"],
-            #     (h, w),
-            #     "depth",
-            # )
+            
+            rendered = decoder.forward(
+                gaussians,
+                example["context"]["extrinsics"],
+                example["context"]["intrinsics"],
+                example["context"]["near"],
+                example["context"]["far"],
+                (h, w),
+                "depth",
+            )
 
             # convert the rotations from camera space to world space as required
             cam_rotations = trim(visualization_dump["rotations"])[0]
@@ -425,26 +428,26 @@ def generate_point_cloud_figure(cfg_dict):
                 w=224,
                 spp=1,
             )
-            c2w_mat = c2w_mat[mask]  # apply trim
+            # c2w_mat = c2w_mat[mask]  # apply trim
 
-            cam_rotations_np = R.from_quat(
-                cam_rotations.detach().cpu().numpy()
-            ).as_matrix()
-            world_mat = c2w_mat.detach().cpu().numpy() @ cam_rotations_np
-            world_rotations = R.from_matrix(world_mat).as_quat()
-            world_rotations = torch.from_numpy(world_rotations).to(
-                visualization_dump["scales"]
-            )
+            # cam_rotations_np = R.from_quat(
+            #     cam_rotations.detach().cpu().numpy()
+            # ).as_matrix()
+            # world_mat = c2w_mat.detach().cpu().numpy() @ cam_rotations_np
+            # world_rotations = R.from_matrix(world_mat).as_quat()
+            # world_rotations = torch.from_numpy(world_rotations).to(
+            #     visualization_dump["scales"]
+            # # )
 
-            export_ply(
-                example["context"]["extrinsics"][0, 0],
-                trim(gaussians.means)[0],
-                trim(visualization_dump["scales"])[0],
-                world_rotations,
-                trim(gaussians.harmonics)[0],
-                trim(gaussians.opacities)[0],
-                base / "gaussians.ply",
-            )
+            # export_ply(
+            #     example["context"]["extrinsics"][0, 0],
+            #     trim(gaussians.means)[0],
+            #     trim(visualization_dump["scales"])[0],
+            #     world_rotations,
+            #     trim(gaussians.harmonics)[0],
+            #     trim(gaussians.opacities)[0],
+            #     base / "gaussians.ply",
+            # )
 
             # save encoder depth map
             depth_vis = (
@@ -459,19 +462,17 @@ def generate_point_cloud_figure(cfg_dict):
                 Image.fromarray(vis_depth).save(f"{base}_depth_{v_idx}.png")
 
             # save context views
-            # save_image(example["context"]["image"][0, 0], f"{base}_input_0.png")
-            # save_image(example["context"]["image"][0, 1], f"{base}_input_1.png")
+            save_image(example["context"]["image"][0, 0], f"{base}_input_0.png")
+            save_image(example["context"]["image"][0, 1], f"{base}_input_1.png")
 
-            # result = rendered.depth.cpu().detach()
-            # print(result.shape)
-            # assert False
-            # for v_idx in range(result.shape[1]):
-            # vis_depth = viz_depth_tensor(
-            # 1.0 / result[0, v_idx], return_numpy=True
-            # )  # inverse depth
-            # save_path = path / scene / f"color/input{v_idx}_depth.png"
-            # os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            # Image.fromarray(vis_depth).save(f"{base}_depth_{v_idx}_gs.png")
+            result = rendered.depth.cpu().detach()
+            print(result.shape)
+          
+            for v_idx in range(result.shape[1]):
+                vis_depth = viz_depth_tensor(
+                1.0 / result[0, v_idx], return_numpy=True
+                )  # inverse depth
+                Image.fromarray(vis_depth).save(f"{base}_depth_{v_idx}_gs.png")
 
             # depth_near = result[result > 0].quantile(0.01).log()
             # depth_far = result.quantile(0.99).log()

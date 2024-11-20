@@ -179,3 +179,7 @@ table.tex
 point_clouds*
 assets/*_3views.json
 test*/
+
+latest-run
+mvsplat-dtu-final
+

@@ -1,5 +1,5 @@
 defaults:
-  - dataset: re10k
+  - dataset: dtu
   - optional dataset/view_sampler_dataset_specific_config: ${dataset/view_sampler}_${dataset}
   - model/encoder: costvolume
   - model/decoder: splatting_cuda
@@ -60,6 +60,7 @@ test:
   save_depth: false
   noisy_pose: false
   noisy_level: 0.05
+  pred_pose_path: None
 
 seed: 111123
 
@@ -69,4 +70,4 @@ trainer:
   gradient_clip_val: null
   num_sanity_val_steps: 2
 
-output_dir: null
+output_dir: outputs/mvsplat-baseline/

@@ -13,7 +13,7 @@ data_loader:
     batch_size: 1
 
 trainer:
-  max_steps: 300_001
+  max_steps: 150_001
 
 # ----- Additional params for default best model customization
 model:
@@ -36,7 +36,7 @@ loss:
 dataset: 
   image_shape: [224, 224]
   original_image_shape: [128, 160]
-  roots: [/home/youngju/ssd/datasets/DTU]
+  roots: [/home/lucy/ssd/datasets/DTU]
   near: 1.
   far: 100.
   baseline_scale_bounds: false

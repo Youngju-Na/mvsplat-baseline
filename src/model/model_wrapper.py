@@ -44,6 +44,14 @@ from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from src.model.cameras.noisy_pose_generator import initialize_noisy_poses
 from src.model.ray_diffusion.eval.utils import full_scene_scale
 
+from src.model.ray_diffusion.eval.utils import (
+    compute_angular_error_batch,
+    compute_camera_center_error,
+    full_scene_scale,
+    n_to_np_rotations,
+    compute_geodesic_distance_from_two_matrices,
+)
+import time
 @dataclass
 class OptimizerCfg:
     lr: float
@@ -61,6 +69,7 @@ class TestCfg:
     noisy_pose: bool
     noisy_level: float
 
+    pred_pose_path: str | None
 
 @dataclass
 class TrainCfg:
@@ -120,9 +129,21 @@ class ModelWrapper(LightningModule):
         self.benchmarker = Benchmarker()
         self.eval_cnt = 0
 
+        self.max_memory = 0
+
         if self.test_cfg.compute_scores:
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
+        
+        if self.test_cfg.pred_pose_path is not None:        # TODO PRED POSE
+            try:
+                self.pred_poses = torch.load(self.test_cfg.pred_pose_path)
+            except:
+                self.pred_poses = None
+                print("No predicted poses found")
+        else:
+            self.pred_poses = None
+
 
     def training_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
@@ -192,27 +213,47 @@ class ModelWrapper(LightningModule):
             gt_scene_scale = full_scene_scale(batch['context'])
             
             gt_context_views = batch["context"]["extrinsics"][..., :3, :4]
-            noisy_context_views, error_R, error_T = initialize_noisy_poses(gt_context_views, noise_level=self.test_cfg.noisy_level, gt_scene_scale=gt_scene_scale)
+            noisy_context_views, error_R, error_T, error_R_copo, error_T_copo = initialize_noisy_poses(gt_context_views, noise_level=self.test_cfg.noisy_level, gt_scene_scale=gt_scene_scale)
             
             print("mean Rotation error angle:", np.mean(error_R))
             print("mean Translation error:", np.mean(error_T))
+            
+            print("mean Rotation error angle CoPoNeRF:", error_R_copo.mean())
+            print("mean Translation error CoPoNeRF:", error_T_copo)
             
             # add to mean error 
             self.log("info/mean_rotation_error", np.mean(error_R))
             self.log("info/mean_translation_error", np.mean(error_T))
             
+            self.log("info/mean_rotation_error_copo", error_R_copo.mean())
+            self.log("info/mean_translation_error_copo", error_T_copo.item())
+            
             if "mean_rotation_error" not in self.test_step_outputs:
                 self.test_step_outputs["mean_rotation_error"] = []
                 self.test_step_outputs["mean_translation_error"] = []
+                self.test_step_outputs["mean_rotation_error_copo"] = []
+                self.test_step_outputs["mean_translation_error_copo"] = []
+                
             self.test_step_outputs["mean_rotation_error"].append(np.mean(error_R).item())
             self.test_step_outputs["mean_translation_error"].append(np.mean(error_T).item())
+            self.test_step_outputs["mean_rotation_error_copo"].append(error_R_copo.mean().item())
+            self.test_step_outputs["mean_translation_error_copo"].append(error_T_copo.item())
             
             #UPDATE poses to noisy poses
             batch["context"]["extrinsics"] = noisy_context_views[:, :n_context_views]
             # batch["target"]["extrinsics"] = all_noisy_poses[:, n_context_views:]
             
-            
+            return 
         
+
+        if self.pred_poses is not None:
+            scene = batch["scene"][0]
+            batch['context']['extrinsics'] = self.pred_poses[scene].unsqueeze(0).cuda().float()
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        start_time = time.time()
+
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
             gaussians = self.encoder(
@@ -230,6 +271,10 @@ class ModelWrapper(LightningModule):
                 (h, w),
                 depth_mode=None,
             )
+        #! EFFICIENCY
+        elapsed_time = time.time() - start_time
+        memory_used = torch.cuda.max_memory_allocated()
+        self.max_memory = max(self.max_memory, memory_used)
 
         (scene,) = batch["scene"]
         name = get_cfg()["wandb"]["name"]
@@ -273,6 +318,46 @@ class ModelWrapper(LightningModule):
             self.test_step_outputs[f"lpips"].append(
                 compute_lpips(rgb_gt, rgb).mean().item()
             )
+
+
+            if f"rotation_angle" not in self.test_step_outputs:
+                self.test_step_outputs[f"rotation_angle"] = []
+            if f"translation_angle" not in self.test_step_outputs:
+                self.test_step_outputs[f"translation_angle"] = []
+
+            pred_mats = rearrange(batch['context']['extrinsics'], 'b v x y -> (b v) x y')
+            R_gt = rearrange(batch['context']['R'], 'b v x y -> (b v) x y')
+            T_gt = rearrange(batch['context']['T'], 'b v x -> (b v) x')
+            
+            #! CoPoNeRF Style evaluation
+            norm_pred = pred_mats[:,:3,3][1:] / torch.linalg.norm(pred_mats[:,:3,3][1:], dim = -1).unsqueeze(-1) + 1e-6
+            norm_gt =  T_gt[1:] / torch.linalg.norm(T_gt[1:], dim =-1).unsqueeze(-1)
+            cosine_similarity_0 = torch.dot(norm_pred[0], norm_gt[0])
+            cosine_similarity_1 = torch.dot(norm_pred[1], norm_gt[1])
+            angle_degree_1 = torch.arccos(torch.clip(cosine_similarity_0, -1.0,1.0)) * 180 / np.pi
+            angle_degree_2 = torch.arccos(torch.clip(cosine_similarity_1, -1.0,1.0)) * 180 / np.pi
+            avg_angle_degree = (angle_degree_1 + angle_degree_2) / 2
+            
+            geodesic = compute_geodesic_distance_from_two_matrices(pred_mats[..., :3, :3][1:], R_gt[..., :3, :3][1:]) * 180 / np.pi
+            self.test_step_outputs[f"rotation_angle"].append(geodesic.mean().item())
+            self.test_step_outputs[f"translation_angle"].append(avg_angle_degree.item())
+
+            #! Inference time and GPU memory calculation
+            if f"inference_time" not in self.test_step_outputs:
+                self.test_step_outputs[f"inference_time"] = []
+            if f"gpu_memory" not in self.test_step_outputs:
+                self.test_step_outputs[f"gpu_memory"] = []
+            self.test_step_outputs[f"inference_time"].append(elapsed_time)
+            self.test_step_outputs[f"gpu_memory"].append(memory_used / 1024**2)
+        
+            print("Rotation:", geodesic, "translation_angle:", avg_angle_degree)
+            print("Rotation error so far:", np.mean(self.test_step_outputs[f"rotation_angle"]), 'Translation_angle so far:', np.mean(self.test_step_outputs[f"translation_angle"]))
+            
+            # print psnr
+            print("scene: ", scene, end=' ')
+            print(f"PSNR: {self.test_step_outputs[f'psnr'][-1]}, SSIM: {self.test_step_outputs[f'ssim'][-1]}, LPIPS: {self.test_step_outputs[f'lpips'][-1]}", end=' ')
+            print("PSNR_so_far: ", np.mean(self.test_step_outputs[f'psnr']))
+
 
     def on_test_end(self) -> None:
         name = get_cfg()["wandb"]["name"]

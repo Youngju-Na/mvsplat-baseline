@@ -181,11 +181,34 @@ class DatasetRE10k(IterableDataset):
                     extrinsics[:, :3, 3] /= scale
                 else:
                     scale = 1
+                
+                #! make the first extrinsics to be the reference view (identical rotation, zero translation) by projection matrices
+                all_indices = torch.cat([context_indices, target_indices])
+                c2ws_all = extrinsics[all_indices].clone()
+                w2cs_all = torch.inverse(c2ws_all)
+                
+                                # Extract the first extrinsic (rotation and translation)
+                def transform_extrinsics(w2cs):
+                    w2cs = w2cs.detach()
+                    ref_w2c_inv = torch.linalg.inv(w2cs[0])
+                    
+                    return torch.einsum('nij,jk->nik', w2cs, ref_w2c_inv)
+
+                w2cs_ref_all = transform_extrinsics(w2cs_all)
+                c2ws_ref_all = w2cs_ref_all.inverse()
+                
+                extrinsics[all_indices] = c2ws_ref_all.clone()
+                extrinsics_gt = extrinsics.clone()
+                
+                R = extrinsics_gt[:, :3, :3]
+                T = extrinsics_gt[:, :3, 3]
+                focal_lengths = repeat(intrinsics[0, :2, :2].diagonal(), 'xy -> b xy', b=len(intrinsics))
 
                 nf_scale = scale if self.cfg.baseline_scale_bounds else 1.0
                 example = {
                     "context": {
                         "extrinsics": extrinsics[context_indices],
+                        "extrinsics_gt": extrinsics_gt[context_indices],
                         "intrinsics": intrinsics[context_indices],
                         "image": context_images,
                         "near": self.get_bound("near", len(context_indices)) / nf_scale,

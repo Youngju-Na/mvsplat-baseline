@@ -30,10 +30,10 @@ from .scene_transform import get_boundingbox
 
 from torchvision import transforms as T
 
-
 from transforms3d.quaternions import qinverse, qmult, rotate_vector, quat2mat, mat2quat
 
-from .ray_utils import build_rays
+
+random.seed(0)
 
 def read_pfm(filename):
     file = open(filename, 'rb')
@@ -116,9 +116,8 @@ class DatasetDTUCfg(DatasetCfgCommon):
     split_filepath: list[Path]
     n_views: int
     view_selection_type: Literal['random', 'best']
-    test_ref_views: list[int]
-    mesh_ref_views: list[int]
-    use_test_ref_views_as_src: bool
+    test_context_views: list[int]
+    test_target_views: list[int]
     single_view: bool
 
 
@@ -200,19 +199,16 @@ class DatasetDTU(IterableDataset):
             
             if self.stage == 'train':
                 view_ids = [ref_view] + src_views[:self.cfg.n_views]
-                
-                
-            else:
-                view_ids = [ref_view] + src_views
-                
-                if self.stage == "test" or self.stage == "mesh":
-                    view_ids = view_ids + view_ids #* to make context views and target views are identical 
-                
+            
+            elif self.stage=='val' or self.stage=='test': 
+                view_ids = self.cfg.test_context_views + self.cfg.test_target_views
+                assert self.cfg.view_sampler.num_context_views == len(self.cfg.test_context_views), "Number of context views does not match the length of test context views"
+                ref_view = self.cfg.test_context_views[0]
                 
             w2c_ref = self.all_extrinsics[self.remap[ref_view]]
             w2c_ref_inv = np.linalg.inv(w2c_ref)
 
-            imgs, depths_h, depths_mvs_h, masks = [], [], [], []
+            imgs, imgs_norm, depths_h, depths_mvs_h, masks = [], [], [], [], []
             intrinsics, w2cs, near_fars = [], [], []
             intrinsics_org_scale = []
             monoNs = []
@@ -234,8 +230,9 @@ class DatasetDTU(IterableDataset):
                 normal_filename = os.path.join(str(self.cfg.roots[0]),
                                             f'Rectified/{scan}_train/normal/rect_{vid + 1:03d}_{light_idx}_r5000_normal.npy')
                 
-                img = Image.open(img_filename) 
-                img = self.transform_img(img)
+                img_src = Image.open(img_filename) 
+                img = self.transform(img_src)
+                
                 imgs += [img]
                 
                 #TODO: duster code
@@ -255,7 +252,7 @@ class DatasetDTU(IterableDataset):
                 if os.path.exists(depth_filename):
                     depth_h = self.read_depth(depth_filename)
                     depths_h += [depth_h]
-            
+
 
             scale_mat, scale_factor = self.cal_scale_mat(img_hw=[self.cfg.image_shape[0], self.cfg.image_shape[1]],
                                                      intrinsics=intrinsics_org_scale, extrinsics=w2cs,
@@ -263,10 +260,11 @@ class DatasetDTU(IterableDataset):
             new_near_fars = []
             new_w2cs = []
             new_c2ws = []
-            new_depths_h = []
-            new_qs = []
-            new_ts = []
-            new_cs = []
+            new_depths_h = [] 
+            new_qs = [] #* quaternion
+            new_rs = [] #* 3x3 rotation matrix
+            new_ts = [] #* translation vector
+            new_cs = [] #* camera origin
             
             for i, (intrinsic, extrinsic, depth) in enumerate(zip(intrinsics_org_scale, w2cs, depths_h)):
             
@@ -290,9 +288,8 @@ class DatasetDTU(IterableDataset):
                 new_c2ws.append(c2w)
                 
                 new_qs.append(mat2quat(w2c[:3, :3]))
-                new_ts.append(w2c[:3, 3])
-            
-                
+                new_rs.append(c2w[:3, :3].copy())
+                new_ts.append(c2w[:3, 3].copy())
                 
                 dist = np.sqrt(np.sum(camera_o ** 2))
                 near = dist - 1 if dist > 1 else 0.1
@@ -313,24 +310,20 @@ class DatasetDTU(IterableDataset):
             T = np.eye(4, dtype=np.float32)
             T[:3, :3] = quat2mat(q12)
             T[:3, -1] = t12
-        
             T = torch.from_numpy(T)
-            
-            
+
+            new_rs = torch.from_numpy(np.stack(new_rs).astype(np.float32))
+            new_ts = torch.from_numpy(np.stack(new_ts).astype(np.float32))
+
             imgs = torch.stack(imgs)
-            masks = torch.stack(masks)
             depths_h = np.stack(new_depths_h)
             
             intrinsics, w2cs, c2ws, near_fars = np.stack(intrinsics), np.stack(new_w2cs), np.stack(new_c2ws), np.stack(new_near_fars)
             intrinsics_org_scale = np.stack(intrinsics_org_scale)
-            monoNs = np.stack(monoNs)
-            start_idx = 0
             
-            #! build rays
-            rays = build_rays(c2ws, intrinsics[..., :3, :3].copy(), self.cfg.image_shape[0], self.cfg.image_shape[1], 1.0)
-            rays_down = build_rays(c2ws, intrinsics[..., :3, :3].copy(), self.cfg.image_shape[0], self.cfg.image_shape[1], 1.0/4)
+            focal_lengths = repeat(intrinsics[0, :2, :2].diagonal(), 'xy -> b xy', b=len(intrinsics))
             
-            
+
             # to tensor
             intrinsics = torch.from_numpy(intrinsics.astype(np.float32)).float()
             intrinsics_org_scale = torch.from_numpy(intrinsics_org_scale.astype(np.float32)).float()
@@ -338,18 +331,10 @@ class DatasetDTU(IterableDataset):
             c2ws = torch.from_numpy(c2ws.astype(np.float32)).float()
             near_fars = torch.from_numpy(near_fars.astype(np.float32)).float()
             depths_h = torch.from_numpy(depths_h.astype(np.float32)).float()
-            monoNs = torch.from_numpy(monoNs.astype(np.float32)).float()
-                        
+            
             # context_indices, target_indices = np.array([i for i in range(len(src_views))]), np.array([0]) 
             context_indices, target_indices = np.array([i for i in range(self.cfg.view_sampler.num_context_views)]), np.array([i for i in range(self.cfg.view_sampler.num_context_views, len(view_ids))])
             context_images, target_images = imgs[context_indices], imgs[target_indices]
-            context_masks, target_masks = masks[context_indices], masks[target_indices]
-            
-            # set all c2ws to be equal to the context's  first (0-th index) matrix
-            c2ws_gt = c2ws.clone()
-            if self.cfg.single_view:
-                c2ws[1:context_indices.max()+1] = c2ws[0]
-            
             # Skip the example if the images don't have the right shape.
             context_image_invalid = context_images.shape[1:] != (3, self.cfg.image_shape[0], self.cfg.image_shape[1])
             target_image_invalid = target_images.shape[1:] != (3, self.cfg.image_shape[0], self.cfg.image_shape[1])
@@ -379,37 +364,21 @@ class DatasetDTU(IterableDataset):
             example = {
                 "context": {
                     "extrinsics": c2ws[context_indices], #* B x 4 x 4
-                    "extrinsics_gt": c2ws_gt[context_indices], #* B x 4 x 4
                     "intrinsics": intrinsics[context_indices][..., :3, :3], #* B x 3 x 3
                     "intrinsics_org_scale": intrinsics_org_scale[context_indices][..., :3, :3], #* B x 3 x 3
                     "image": context_images, #* B x 3 x H x W
                     "depth": depths_h[context_indices], #* B x H x W
-                    "mask": context_masks, #* B x 3 x H x W
                     # "near": self.get_bound("near", len(context_indices)) / scale,
                     # "far": self.get_bound("far", len(context_indices)) / scale,
                     "near": near_fars[context_indices][:, 0], #* B
                     "far": near_fars[context_indices][:, 1], #* B
+                    "near_canonical": 1.0,
+                    "far_canonical": 3.4,
                     "index": context_indices,
                     "view_ids": [view_ids[i] for i in context_indices],
-                    "mono": monoNs[context_indices], #* B x 3 x H x W
-                    
-                    "rays": rays[context_indices], #* B x 3 x
-                    "rays_down": rays_down[context_indices], #* B x 3 x
-                    
-                    #! MicKey Specific
-                    "image0": context_images[0], #* 3 x H x W
-                    "image1": context_images[1], #* 3 x H x W
-                    'T_0to1': T,
-                    'abs_q_0': q1,
-                    'abs_c_0': c1, # (3,)
-                    'abs_q_1': q2, # (4,)
-                    'abs_c_1': c2, # (3,)
-                    'K_color0': intrinsics_org_scale[0][:3, :3],  # (3, 3)
-                    'Kori_color0': intrinsics_org_scale[0][:3, :3],  # (3, 3)
-                    'K_color1': intrinsics_org_scale[1][:3, :3],  # (3, 3)
-                    'Kori_color1': intrinsics_org_scale[1][:3, :3],  # (3, 3)
-                    'dataset_name': 'DTU',
-                    'scene': scan,
+                    "R": new_rs[context_indices], #* B x 3 x 3
+                    "T": new_ts[context_indices], #* B x 3
+                    "focal_length": focal_lengths[context_indices], #* B x 2
                     
                 },
                 "target": {
@@ -418,17 +387,16 @@ class DatasetDTU(IterableDataset):
                     "intrinsics_org_scale": intrinsics_org_scale[target_indices][..., :3, :3],
                     "image": target_images,
                     "depth": depths_h[target_indices],
-                    "mask": target_masks,
                     # "near": self.get_bound("near", len(target_indices)) / scale,
                     # "far": self.get_bound("far", len(target_indices)) / scale,
                     "near": near_fars[target_indices][:, 0],
                     "far": near_fars[target_indices][:, 1],
                     "index": target_indices,
                     "view_ids": [view_ids[i] for i in target_indices],
-                    "mono": monoNs[target_indices],
                     
-                    "rays": rays[target_indices],
-                    "rays_down": rays_down[target_indices],
+                    "R": new_rs[target_indices],
+                    "T": new_ts[target_indices],
+                    "focal_length": focal_lengths[target_indices],
                     
                 },
                 "scene": scan, #* string for scene name
@@ -438,6 +406,7 @@ class DatasetDTU(IterableDataset):
             if self.stage == "train" and self.cfg.augment:
                 example = apply_augmentation_shim(example)
             yield apply_crop_shim(example, tuple(self.cfg.image_shape))
+            # return example
 
     
     def convert_poses(
@@ -518,7 +487,7 @@ class DatasetDTU(IterableDataset):
         
         metas = []
         ref_src_pairs = {} # referece view와 source view의 pair를 만든다.
-        light_idxs = [3] if 'train' not in self.stage else range(7)
+        light_idxs = [3]
 
         with open(self.pair_filepath) as f:
             num_viewpoint = int(f.readline())
@@ -529,11 +498,20 @@ class DatasetDTU(IterableDataset):
 
                 ref_src_pairs[ref_view] = src_views
 
-        for light_idx in light_idxs:
-            for scan in self.scans:
+        for light_idx in light_idxs: #* test 인 경우 light_idx는 3만 사용
+            for scan in self.scans:  #* test인 경우 15개의 scenes
                 with open(self.pair_filepath) as f:
                     num_viewpoint = int(f.readline())
-                    # viewpoints (49)
+                    
+                    #! in test stage
+                    if self.stage == "test" and len(self.cfg.test_context_views) > 0:
+                        context_views = self.cfg.test_context_views
+                        assert len(self.cfg.test_target_views) > 0
+                        target_views = self.cfg.test_target_views
+                        metas += [(scan, light_idx, context_views, target_views)]
+                        continue
+                    
+                    #! in training stage
                     for _ in range(num_viewpoint):
                         ref_view = int(f.readline().rstrip())
                         src_views = [int(x) for x in f.readline().rstrip().split()[1::2]]
@@ -549,22 +527,8 @@ class DatasetDTU(IterableDataset):
                         else:
                             raise NotImplementedError
                         
-                        # ! only for validation
-                        if self.stage == 'test' and len(self.cfg.test_ref_views) > 0:
-                            if ref_view not in [self.cfg.test_ref_views[0]]:
-                                continue
-                            else:
-                                if self.cfg.use_test_ref_views_as_src:
-                                    # src_view should be test_ref_views without ref_view
-                                    src_views = [x for x in self.cfg.test_ref_views if x != ref_view]
-                        elif self.stage == 'mesh' and len(self.cfg.mesh_ref_views) >0 :
-                            if ref_view not in [self.cfg.mesh_ref_views[0]]:
-                                continue
-                            else:
-                                if self.cfg.use_test_ref_views_as_src:
-                                    src_views = [x for x in self.cfg.mesh_ref_views if x != ref_view]
-                              
                         metas += [(scan, light_idx, ref_view, src_views)] # scan, light_idx, ref_view, src_views
+
 
         return metas, ref_src_pairs
 
@@ -657,8 +621,10 @@ class DatasetDTU(IterableDataset):
             self.remap[item] = i
             
     def define_transforms(self):
-        self.transform = T.Compose([T.ToTensor(), T.Resize((self.cfg.image_shape[0], self.cfg.image_shape[1]))])        
-        self.transform_img = T.Compose([T.ToTensor(), T.Resize((self.cfg.image_shape[0], self.cfg.image_shape[1]))])
+        self.transform = T.Compose([T.ToTensor(), T.Resize((self.cfg.image_shape[0], self.cfg.image_shape[1]))])     
+        self.transform_norm = T.Compose([T.ToTensor(), T.Resize((self.cfg.image_shape[0], self.cfg.image_shape[1])), T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+            
+                                           
     
     def __len__(self) -> int:
         # return len(self.index.keys())
